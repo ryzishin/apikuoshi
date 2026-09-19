@@ -1,0 +1,227 @@
+/**
+ * ============================================================
+ *  APIKuoshi — src/core/fallback.js
+ * ============================================================
+ *  The resolution machinery.
+ *
+ *  Behaviour:
+ *    - One set of endpoints. A request is tried against internal
+ *      data lanes in priority order; the first lane that returns
+ *      data wins. Failures are swallowed and logged (the caller
+ *      just gets data — or a clean 502 if nothing works).
+ *    - unifiedSearch() merges every lane's results into ONE list,
+ *      anchored to canonical AniList identity so romaji/English
+ *      duplicates collapse into a single entry.
+ * ============================================================
+ */
+import { listLanes, getLane } from "./registry.js";
+import config from "../config.js";
+import { withCache } from "./cache.js";
+import { keyForIds, cleanListingSlug, titleSlug } from "./shape.js";
+
+function withTimeout(promise, ms, label) {
+  const timeout = new Promise((_, reject) =>
+    setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms)
+  );
+  return Promise.race([promise, timeout]);
+}
+
+/**
+ * Run `fn(lane)` across lanes in priority order.
+ * Returns the first non-empty, non-throwing result.
+ */
+export async function withFallback(fn, { label = "call", timeoutMs = config.sourceTimeoutMs } = {}) {
+  const lanes = listLanes();
+  const failures = [];
+
+  for (const lane of lanes) {
+    try {
+      const result = await withTimeout(Promise.resolve(fn(lane)), timeoutMs, lane.id);
+      const empty =
+        result === null ||
+        result === undefined ||
+        (Array.isArray(result) && result.length === 0) ||
+        (result && typeof result === "object" && Array.isArray(result.data) && result.data.length === 0);
+      if (!empty) return result;
+      failures.push(`${lane.id}: empty result`);
+    } catch (err) {
+      // SILENT by design — log for operators, keep the chain moving.
+      console.error(`[APIKUOSHI][fallback:${label}] ${lane.id} failed:`, err.message);
+      failures.push(`${lane.id}: ${err.message}`);
+    }
+  }
+  const error = new Error(`No data available for ${label} right now.`);
+  error.statusCode = 502;
+  error.failures = failures;
+  throw error;
+}
+
+/**
+ * Unified search.
+ * 1. AniList provides the canonical candidate list (romaji + english +
+ *    synonyms) — one call, cached.
+ * 2. Every lane is queried in parallel (Promise.allSettled).
+ * 3. Each result is anchored to a canonical AniList entry when the title
+ *    similarity clears the threshold; leftovers are grouped among
+ *    themselves by signature/similarity (titles.js).
+ * 4. Groups are returned as single entries — duplicates gone.
+ *
+ * Returns { query, page, groups } where each group carries the public
+ * fields plus `lanes` (internal listing handles used by /api/chain).
+ */
+export async function unifiedSearch(query, page = 1) {
+  // v3 cache key: v2.3.0 normalizes status/type vocabularies and adds the
+  // art fields — stale pre-2.3 cached groups must not leak old shapes.
+  return withCache(`search:${query.toLowerCase()}:${page}:v3`, config.cacheSeconds, async () => {
+    const { groupEntries, titleSimilarity } = await import("./titles.js");
+    const { anilistSearch } = await import("./anilist.js");
+    const { rememberAnime } = await import("./identity.js");
+
+    // v2.4.0: the canonical AniList candidate call runs IN PARALLEL with the
+    // lane queries (it used to be awaited first — pure serial dead time;
+    // short-circuit ordering of the lanes themselves is unchanged).
+    const canonicalP = anilistSearch(query, 10);
+
+    // 1. lanes that search directly
+    const direct = await Promise.allSettled([
+      getLane("kaze").search(query, page),
+      getLane("ishi").search(query),
+    ]);
+
+    const canonical = await canonicalP;
+    // v2.4.0: every AniList candidate seeds the shared identity index
+    for (const c of canonical || []) rememberAnime(c);
+
+    const allEntries = [];
+    direct.forEach((r) => {
+      if (r.status === "fulfilled" && Array.isArray(r.value)) allEntries.push(...r.value);
+      else if (r.status === "rejected") console.error(`[APIKUOSHI][search] lane failed:`, r.reason?.message);
+    });
+
+    // 2. anchor entries to canonical AniList rows
+    for (const entry of allEntries) {
+      if (entry.anilistId) continue;
+      // v2.2.1: exact-title tie-break — upstream result order must never
+      // decide between two candidates that score the same
+      const { pickBestBySimilarity } = await import("./titles.js");
+      const { best, score } = pickBestBySimilarity(entry.title, canonical, (c) => {
+        const candidateTitles = [
+          c.titleRomaji, c.titleEnglish, c.title,
+          ...(Array.isArray(c.synonyms) ? c.synonyms : []),
+        ].filter(Boolean);
+        let s = 0;
+        for (const ct of candidateTitles) {
+          s = Math.max(s, titleSimilarity(entry.title, ct));
+          if (entry.titleAlt) s = Math.max(s, titleSimilarity(entry.titleAlt, ct));
+        }
+        return s;
+      });
+      if (best && score >= config.dedupThreshold) {
+        entry.anilistId = best.anilistId;
+        entry.matchScore = score;
+        // v2.4.0: remember lane-row ↔ AniList row links (slug + title),
+        // so catalog rows for the same anime inherit the identity
+        rememberAnime({
+          anilistId: best.anilistId,
+          malId: best.malId ?? null,
+          listingId: entry.listingId || entry.slug || "",
+          slug: cleanListingSlug(entry.listingId || entry.slug || ""),
+          title: entry.title || best.titleRomaji || best.title,
+        });
+      }
+    }
+
+    // 3. group everything (anilistId groups win over fuzzy groups)
+    const groups = [];
+    const byAnilist = new Map();
+
+    for (const entry of allEntries) {
+      if (entry.anilistId && byAnilist.has(entry.anilistId)) {
+        byAnilist.get(entry.anilistId).members.push(entry);
+      } else if (entry.anilistId) {
+        const canon = canonical.find((c) => c.anilistId === entry.anilistId) || null;
+        const group = {
+          anilistId: entry.anilistId,
+          canonical: canon,
+          title: canon?.title || entry.title,
+          members: [entry],
+        };
+        byAnilist.set(entry.anilistId, group);
+        groups.push(group);
+      } else {
+        groups.push({ anilistId: null, canonical: null, title: entry.title, members: [entry] });
+      }
+    }
+
+    // fuzzy-merge the unanchored leftovers into anchored groups when titles clearly match
+    const anchored = groups.filter((g) => g.anilistId);
+    const loose = groups.filter((g) => !g.anilistId);
+    for (const g of [...loose]) {
+      for (const a of anchored) {
+        const c = a.canonical;
+        const score = Math.max(
+          titleSimilarity(g.title, c?.titleRomaji || a.title),
+          titleSimilarity(g.title, c?.titleEnglish || a.title),
+          g.members[0]?.titleAlt ? titleSimilarity(g.members[0].titleAlt, c?.titleRomaji || a.title) : 0
+        );
+        if (score >= config.dedupThreshold) {
+          a.members.push(...g.members);
+          g.members = [];
+          break;
+        }
+      }
+    }
+    const finalGroups = [...anchored, ...loose.filter((g) => g.members.length)];
+
+    // 4. shape each group: public fields + internal lane handles
+    return {
+      query,
+      page,
+      groups: finalGroups.map((g) => {
+        const canon = g.canonical;
+        const first = g.members.find((m) => m.poster)?.poster ? g.members : g.members;
+        const lanes = {};
+        for (const m of g.members) {
+          if (!m.lane) continue;
+          (lanes[m.lane] ||= []).push({
+            listingId: m.listingId,
+            title: m.title,
+            matchScore: m.matchScore || (m.anilistId ? 100 : null),
+          });
+        }
+        // slug: a real listing slug from any member beats a derived one
+        const listingSlug =
+          cleanListingSlug(g.members.find((m) => m.lane === "kaze" && m.listingId)?.listingId || "");
+        const derivedSlug = titleSlug(canon?.titleRomaji || canon?.title || g.title || "");
+        const slug = listingSlug || derivedSlug;
+        return {
+          key: keyForIds({ anilistId: g.anilistId, malId: canon?.malId ?? g.members.find((m) => m.malId)?.malId ?? null, slug }),
+          anilistId: g.anilistId,
+          malId: canon?.malId ?? g.members.find((m) => m.malId)?.malId ?? null,
+          slug,
+          title: canon?.title || g.title,
+          titleRomaji: canon?.titleRomaji ?? g.members.find((m) => m.titleAlt)?.titleAlt ?? null,
+          titleEnglish: canon?.titleEnglish ?? null,
+          // v2.3.0: poster prefers the PRIMARY lane's listing art (the same
+          // image every browse row and the slug-keyed detail surfaces show);
+          // AniList's cover is the fallback, not the default. This keeps
+          // cross-surface poster agreement (trending == search == detail).
+          poster: g.members.find((m) => m.poster)?.poster ?? canon?.poster ?? null,
+          year: canon?.year ?? null,
+          type: canon?.format ?? g.members.find((m) => m.type)?.type ?? null,
+          episodes: canon?.episodes ?? g.members.find((m) => m.episodes)?.episodes ?? null,
+          status: canon?.status ?? null,
+          // v2.4.0: shapeMedia emits genres:[] even when the AniList query
+          // didn't select them — fall through to lane rows on empty arrays
+          genres: (Array.isArray(canon?.genres) && canon.genres.length)
+            ? canon.genres
+            : (g.members.find((m) => Array.isArray(m.genres) && m.genres.length)?.genres ?? []),
+          sub: g.members.find((m) => Number.isFinite(m.sub))?.sub ?? null,
+          dub: g.members.find((m) => Number.isFinite(m.dub))?.dub ?? null,
+          lanes,
+          _first: first,
+        };
+      }),
+    };
+  });
+}
